@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ASCII Bouquet</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07070a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+  #hint {
+    position: fixed; left: 16px; bottom: 12px;
+    font: 12px ui-monospace, Menlo, Consolas, monospace;
+    color: #8a8a99; opacity: .85; transition: opacity 1.2s; pointer-events: none;
+  }
+  #hint.off { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">click / R = replay &middot; S = save png &middot; ?msg=text</div>
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// How it works:
+//   1. Stems, leaves and the ribbon are drawn with canvas paths onto a tiny
+//      "low" canvas where 1 pixel = 1 character cell.
+//   2. The lilies are real 3D meshes (curved, cupped petals that open and
+//      recurve), lit and rasterized with a z-buffer straight into that grid.
+//   3. Each cell's brightness picks a character from RAMP; characters are
+//      stamped in white from a glyph atlas, then tinted with the cell colors.
+// ---------------------------------------------------------------------------
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const low = document.createElement('canvas');
+const lx = low.getContext('2d', { willReadFrequently: true });
+const glow = document.createElement('canvas');
+const gx = glow.getContext('2d');
+const atlas = document.createElement('canvas');
+const ax = atlas.getContext('2d');
+
+const RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+const QS = new URLSearchParams(location.search);
+const MSG = (QS.get('msg') || '').slice(0, 40);
+const FIXED_T = QS.has('t') ? parseFloat(QS.get('t')) : NaN; // ?t=6 freezes the animation at 6s
+const BG = '#07070a';
+const TAU = Math.PI * 2;
+
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+const smooth = v => (v = clamp01(v), v * v * (3 - 2 * v));
+const easeOut = v => (v = clamp01(v), 1 - Math.pow(1 - v, 3));
+const lerp = (a, b, k) => a + (b - a) * k;
+function seeded(seed) {
+  return () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = seeded(20261122);
+
+// ---------- 3D vector helpers ----------
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const vnorm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+function basis(A) {
+  const B = vnorm(Math.abs(A[2]) < 0.98 ? cross(A, [0, 0, 1]) : cross(A, [1, 0, 0]));
+  return [B, cross(A, B)];
+}
+
+// ---------- colors ----------
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+const pal = (c, m, t, v, spots) => ({ c: hex(c), m: hex(m), t: hex(t), v: hex(v), spots });
+// throat -> center -> body -> tip, vein/spot color
+const PAL = {
+  red:     pal('#ffe27a', '#ff2a2a', '#ff7058', '#7a0614', true),
+  pink:    pal('#fff3b0', '#ec3aa2', '#ff9ad8', '#6e0a46', true),
+  cream:   pal('#fff7c8', '#f6ece2', '#ffffff', '#e0849c', false),
+  peach:   pal('#fff0b0', '#f7a070', '#ffd6bc', '#b0482a', false),
+  yellow:  pal('#fff8c8', '#ffc414', '#ffe27a', '#b06400', false),
+  orange:  pal('#ffe9a0', '#ff7a12', '#ffa848', '#8a2a06', true),
+  magenta: pal('#ffe6f2', '#c42d8f', '#ea86d8', '#520a3c', true),
+};
+const THROAT = hex('#c6e26a'), BUDG = hex('#5c9a44'), STEMG = hex('#6fae4a');
+const WHITE = [1, 1, 1], BLACK = [0, 0, 0];
+const LIGHT = vnorm([-0.4, -0.55, 0.75]);
+const HALF = vnorm([LIGHT[0], LIGHT[1], LIGHT[2] + 1]);
+
+// ---------- the bouquet ----------
+// Scene units: ribbon at y=-0.2, stems run down to the screen edge, up is negative y.
+//   x,     y,     size,  palette,   tilt,  facing, delay
+const FLOWERS = [
+  [ 0.00, -0.80, 0.170, 'red',      0.10, 0.85, 0.0],
+  [-0.21, -0.64, 0.160, 'pink',    -0.30, 0.80, 0.5],
+  [ 0.21, -0.60, 0.160, 'cream',    0.35, 0.75, 0.9],
+  [-0.03, -0.48, 0.150, 'peach',    0.00, 0.90, 1.5],
+  [-0.34, -0.86, 0.120, 'yellow',  -0.50, 0.70, 0.3],
+  [ 0.33, -0.84, 0.120, 'magenta',  0.50, 0.70, 0.8],
+  [-0.38, -0.47, 0.110, 'yellow',  -0.70, 0.65, 1.8],
+  [ 0.39, -0.44, 0.110, 'red',      0.80, 0.65, 2.1],
+  [ 0.09, -1.02, 0.110, 'orange',   0.15, 0.75, 1.2],
+  [-0.17, -1.00, 0.100, 'cream',   -0.25, 0.80, 1.6],
+].map(([x, y, L, p, tilt, sq, d]) => {
+  const f = {
+    x, y, L: L * 1.55, P: PAL[p], tilt, sq, d,
+    z: (y + 1.15) * 0.35,
+    rot0: rng() * TAU, ph: rng() * TAU, bx: (rng() - 0.5) * 0.02,
+  };
+  f.pet = Array.from({ length: 6 }, (_, i) => ({
+    P: f.P, e: 0, var: rng() * 2 - 1, seed: rng() * 100,
+    spots: Array.from({ length: 11 }, () => ({
+      u: 0.12 + rng() * 0.45, v: (rng() * 2 - 1) * 0.7, r: 0.035 + rng() * 0.03,
+    })),
+  }));
+  let side = rng() < 0.5 ? -1 : 1;
+  f.leaves = [0.42, 0.66].map(s => ({
+    s: s + rng() * 0.1, side: (side = -side),
+    ang: 0.5 + rng() * 0.35, len: 0.09 + rng() * 0.05, w: 0.014 + rng() * 0.006,
+  }));
+  return f;
+});
+
+// ---------- layout / buffers ----------
+let W, H, cw, ch, cols, rows, S, ox, oy, kx, ky, bx, by, noise, stars, stemBottom, ZB;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+
+  const fontCss = Math.max(5, Math.min(9, Math.round(Math.min(H, W * 0.8) / 160)));
+  const fontPx = Math.round(fontCss * dpr);
+  const font = `bold ${fontPx}px ui-monospace, Menlo, Consolas, "Courier New", monospace`;
+  ax.font = font;
+  cw = Math.ceil(ax.measureText('M').width);
+  ch = Math.round(fontPx * 1.08);
+  cols = Math.ceil(cv.width / cw); rows = Math.ceil(cv.height / ch);
+  low.width = cols; low.height = rows;
+  glow.width = Math.ceil(cols / 3); glow.height = Math.ceil(rows / 3);
+  ZB = new Float32Array(cols * rows);
+
+  atlas.width = cw * RAMP.length; atlas.height = ch;
+  ax.font = font; ax.fillStyle = '#fff';
+  ax.textAlign = 'center'; ax.textBaseline = 'middle';
+  for (let i = 0; i < RAMP.length; i++) ax.fillText(RAMP[i], i * cw + cw / 2, ch / 2);
+
+  noise = new Float32Array(cols * rows);
+  for (let i = 0; i < noise.length; i++) {
+    const s = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+    noise[i] = (s - Math.floor(s)) * 2 - 1;
+  }
+
+  S = Math.min(cv.width / 1.3, cv.height / (MSG ? 1.64 : 1.44));
+  ox = cv.width / 2;
+  oy = cv.height / 2 + (MSG ? 0.45 : 0.55) * S;
+  kx = S / cw; ky = S / ch; bx = ox / cw; by = oy / ch;
+  stemBottom = (cv.height - oy) / S + 0.02; // just past the bottom edge
+
+  stars = Array.from({ length: Math.round(cols * rows / 240) }, () => ({
+    x: (Math.random() * cols) | 0, y: (Math.random() * rows) | 0,
+    ph: Math.random() * TAU, sp: 0.5 + Math.random() * 1.5,
+    c: Math.random() < 0.3 ? '255,200,230' : '210,220,255',
+  }));
+}
+
+// ---------- 2D parts: stems, leaves, ribbon ----------
+
+function bez(P, t) {
+  const u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [a * P[0][0] + b * P[1][0] + c * P[2][0] + d * P[3][0],
+          a * P[0][1] + b * P[1][1] + c * P[2][1] + d * P[3][1]];
+}
+
+// s in [0,1]: straight from the cut end up to the ribbon, then a curve to the head
+function stemPoint(f, sw, s) {
+  const bot = [f.x * 0.22 + f.bx, stemBottom], tie = [f.x * 0.03, -0.2];
+  if (s < 0.22) { const k = s / 0.22; return [lerp(bot[0], tie[0], k), lerp(bot[1], tie[1], k)]; }
+  const k = (s - 0.22) / 0.78;
+  return bez([tie, [tie[0] + (tie[0] - bot[0]) * 0.35, tie[1] - 0.11],
+              [f.x * 0.8 + sw * 0.5, lerp(-0.2, f.y, 0.55)], [f.x + sw, f.y]], k);
+}
+function stemDir(f, sw, s) {
+  const a = stemPoint(f, sw, Math.max(0, s - 0.01)), b = stemPoint(f, sw, Math.min(1, s + 0.01));
+  const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+  return [(b[0] - a[0]) / l, (b[1] - a[1]) / l];
+}
+
+function drawStem(f, sw, g) {
+  const N = 40;
+  lx.beginPath();
+  for (let k = 0; k <= N; k++) {
+    const p = stemPoint(f, sw, g * k / N);
+    k ? lx.lineTo(p[0], p[1]) : lx.moveTo(p[0], p[1]);
+  }
+  const gr = lx.createLinearGradient(0, stemBottom, 0, f.y);
+  gr.addColorStop(0, '#2a6a24'); gr.addColorStop(0.5, '#4ea83a'); gr.addColorStop(1, '#79c850');
+  lx.strokeStyle = gr; lx.lineWidth = 0.011; lx.lineCap = 'butt'; lx.lineJoin = 'round';
+  lx.stroke();
+}
+
+function drawLeaf(x, y, ang, len, w) {
+  const b = (Math.cos(ang) >= 0 ? 1 : -1) * 0.18 * len; // tip droops downward
+  lx.save();
+  lx.translate(x, y); lx.rotate(ang);
+  lx.beginPath(); lx.moveTo(0, 0);
+  lx.bezierCurveTo(len * 0.3, -w, len * 0.75, -w * 0.45 + b * 0.6, len, b);
+  lx.bezierCurveTo(len * 0.75, w * 0.45 + b * 0.6, len * 0.3, w, 0, 0);
+  const g = lx.createLinearGradient(0, 0, len, b);
+  g.addColorStop(0, '#2a7a2a'); g.addColorStop(0.55, '#4fb53e'); g.addColorStop(1, '#9be26a');
+  lx.fillStyle = g; lx.fill();
+  lx.beginPath(); lx.moveTo(0, 0); lx.quadraticCurveTo(len * 0.5, b * 0.3, len * 0.95, b * 0.95);
+  lx.strokeStyle = 'rgba(205,255,165,.45)'; lx.lineWidth = 0.003; lx.stroke();
+  lx.restore();
+}
+
+function drawRibbon(k) {
+  if (k <= 0) return;
+  lx.save();
+  lx.translate(0, -0.2); lx.scale(k * 1.45, k * 1.45);
+  const g = lx.createLinearGradient(0, -0.05, 0, 0.12);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.45, '#eeeef4'); g.addColorStop(1, '#b4b4c2');
+  lx.fillStyle = g;
+  lx.strokeStyle = 'rgba(120,120,140,.75)'; lx.lineWidth = 0.003;
+  for (const s of [-1, 1]) { // tails
+    lx.beginPath(); lx.moveTo(s * 0.006, 0.004);
+    lx.quadraticCurveTo(s * 0.03, 0.06, s * 0.05, 0.12);
+    lx.lineTo(s * 0.032, 0.105);
+    lx.quadraticCurveTo(s * 0.02, 0.06, -s * 0.004, 0.01);
+    lx.closePath(); lx.fill(); lx.stroke();
+  }
+  lx.fillRect(-0.042, -0.016, 0.084, 0.032); // band
+  lx.strokeRect(-0.042, -0.016, 0.084, 0.032);
+  for (const s of [-1, 1]) { // loops
+    lx.beginPath(); lx.moveTo(0, 0);
+    lx.bezierCurveTo(s * 0.05, -0.065, s * 0.115, -0.025, s * 0.088, 0.018);
+    lx.bezierCurveTo(s * 0.065, 0.04, s * 0.03, 0.016, 0, 0);
+    lx.fill(); lx.stroke();
+  }
+  lx.beginPath(); lx.ellipse(0, 0, 0.018, 0.016, 0, 0, TAU);
+  lx.fillStyle = '#f6f6fa'; lx.fill(); lx.stroke();
+  lx.restore();
+}
+
+// ---------- 3D lily rasterizer ----------
+// Writes straight into IMG (the low canvas pixels) with a depth buffer.
+
+const NU = 16, NV = 10, NVERT = (NU + 1) * (NV + 1);
+const PX = new Float32Array(NVERT), PY = new Float32Array(NVERT), PZ = new Float32Array(NVERT);
+const SX = new Float32Array(NVERT), SY = new Float32Array(NVERT);
+const NX = new Float32Array(NVERT), NY = new Float32Array(NVERT), NZ = new Float32Array(NVERT);
+const UU = new Float32Array(NVERT), VV = new Float32Array(NVERT);
+const CR = new Float32Array(NU + 1), CA = new Float32Array(NU + 1), CT = new Float32Array(NU + 1);
+let IMG = null;
+const COL = [0, 0, 0];
+
+function setMix(a, b, k) { COL[0] = a[0] + (b[0] - a[0]) * k; COL[1] = a[1] + (b[1] - a[1]) * k; COL[2] = a[2] + (b[2] - a[2]) * k; }
+function mixIn(b, k) { COL[0] += (b[0] - COL[0]) * k; COL[1] += (b[1] - COL[1]) * k; COL[2] += (b[2] - COL[2]) * k; }
+
+function writePixel(i, nx, ny, nz, ambient) {
+  const dif = Math.max(0, nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]);
+  const spec = Math.pow(Math.max(0, nx * HALF[0] + ny * HALF[1] + nz * HALF[2]), 24) * 0.35;
+  const lit = ambient + (1 - ambient) * 1.1 * dif;
+  const p = i * 4;
+  IMG[p] = (COL[0] * lit + spec) * 255;
+  IMG[p + 1] = (COL[1] * lit + spec) * 255;
+  IMG[p + 2] = (COL[2] * lit + spec) * 255;
+  IMG[p + 3] = 255;
+}
+
+// petal surface color at (u along length, v across width)
+function shadePetal(i, u, v, nx, ny, nz, pc) {
+  const l = Math.hypot(nx, ny, nz) || 1;
+  nx /= l; ny /= l; nz /= l;
+  const front = nz >= 0; // seeing the inner (colored) face?
+  if (!front) { nx = -nx; ny = -ny; nz = -nz; }
+  const P = pc.P, av = Math.abs(v);
+
+  if (u < 0.16) setMix(THROAT, P.c, u / 0.16);
+  else if (u < 0.34) setMix(P.c, P.m, (u - 0.16) / 0.18);
+  else if (u < 0.78) setMix(P.m, P.m, 0);
+  else setMix(P.m, P.t, (u - 0.78) / 0.22);
+
+  if (front) {
+    if (av < 0.13 && u > 0.06 && u < 0.9) mixIn(P.v, 0.42 * (1 - av / 0.13)); // midrib groove
+    if (u > 0.1 && Math.cos(v * Math.PI * 4.5) > 0.86) mixIn(BLACK, 0.12);   // fine veins
+    if (P.spots && pc.e > 0.3) {
+      for (const s of pc.spots) {
+        const du = u - s.u, dv = (v - s.v) * 0.24;
+        if (du * du + dv * dv < s.r * s.r) { mixIn(P.v, 0.9 * clamp01((pc.e - 0.3) / 0.5)); break; }
+      }
+    }
+    if (av > 0.8) mixIn(P.t, (av - 0.8) / 0.2 * 0.5); // light rim
+  } else {
+    mixIn(WHITE, 0.15);
+    mixIn(STEMG, (1 - u) * (1 - u) * 0.6);
+    if (av < 0.1) mixIn(STEMG, 0.3);
+  }
+  const bud = 1 - pc.e;
+  if (bud > 0) mixIn(BUDG, bud * bud * (front ? 0.75 : 0.9));
+  writePixel(i, nx, ny, nz, 0.3);
+}
+
+function rasterTri(a, b, c, pc) {
+  const x0 = SX[a], y0 = SY[a], x1 = SX[b], y1 = SY[b], x2 = SX[c], y2 = SY[c];
+  const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+  if (area === 0) return;
+  const inv = 1 / area;
+  const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2)));
+  const maxX = Math.min(cols - 1, Math.ceil(Math.max(x0, x1, x2)));
+  const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2)));
+  const maxY = Math.min(rows - 1, Math.ceil(Math.max(y0, y1, y2)));
+  for (let py = minY; py <= maxY; py++) {
+    const cy = py + 0.5;
+    for (let px = minX; px <= maxX; px++) {
+      const cx = px + 0.5;
+      const w0 = ((x1 - cx) * (y2 - cy) - (x2 - cx) * (y1 - cy)) * inv;
+      const w1 = ((x2 - cx) * (y0 - cy) - (x0 - cx) * (y2 - cy)) * inv;
+      const w2 = 1 - w0 - w1;
+      if (w0 < -1e-6 || w1 < -1e-6 || w2 < -1e-6) continue;
+      const z = w0 * PZ[a] + w1 * PZ[b] + w2 * PZ[c];
+      const i = py * cols + px;
+      if (z <= ZB[i]) continue;
+      ZB[i] = z;
+      shadePetal(i,
+        w0 * UU[a] + w1 * UU[b] + w2 * UU[c],
+        w0 * VV[a] + w1 * VV[b] + w2 * VV[c],
+        w0 * NX[a] + w1 * NX[b] + w2 * NX[c],
+        w0 * NY[a] + w1 * NY[b] + w2 * NY[c],
+        w0 * NZ[a] + w1 * NZ[b] + w2 * NZ[c], pc);
+    }
+  }
+}
+
+// One petal: a strip that leaves the axis A at angle th0, bends by `curl`
+// toward the tip (recurve), and is cupped across its width.
+function rasterPetal(O, A, R, Lp, W, th0, curl, cup, ruff, r0, pc) {
+  const T = cross(A, R);
+  let r = r0, a = 0;
+  for (let k = 0; k <= NU; k++) {
+    const u = k / NU, th = th0 + curl * u * u;
+    CT[k] = th; CR[k] = r; CA[k] = a;
+    const thm = th0 + curl * Math.pow(u + 0.5 / NU, 2);
+    r += Math.sin(thm) * Lp / NU; a += Math.cos(thm) * Lp / NU;
+  }
+  for (let k = 0; k <= NU; k++) {
+    const u = k / NU, th = CT[k], nr = -Math.cos(th), na = Math.sin(th);
+    const prof = Math.max(0, Math.sin(Math.PI * Math.pow(u, 0.75))) * 0.9 + 0.12 * (1 - u);
+    for (let j = 0; j <= NV; j++) {
+      const v = -1 + 2 * j / NV, idx = k * (NV + 1) + j, v2 = v * v;
+      const w = W * prof * (1 + ruff * Math.sin(u * 23 + pc.seed) * v2 * Math.abs(v));
+      const disp = cup * w * v2 + ruff * 0.9 * w * Math.sin(u * 31 + pc.seed * 3) * v2 * v2;
+      const rr = CR[k] + nr * disp, aa = CA[k] + na * disp, tt = v * w;
+      const X = O[0] + A[0] * aa + R[0] * rr + T[0] * tt;
+      const Y = O[1] + A[1] * aa + R[1] * rr + T[1] * tt;
+      PX[idx] = X; PY[idx] = Y;
+      PZ[idx] = O[2] + A[2] * aa + R[2] * rr + T[2] * tt;
+      SX[idx] = X * kx + bx; SY[idx] = Y * ky + by;
+      UU[idx] = u; VV[idx] = v;
+    }
+  }
+  for (let k = 0; k <= NU; k++) {
+    const th = CT[k], nr = -Math.cos(th), na = Math.sin(th);
+    const inX = A[0] * na + R[0] * nr, inY = A[1] * na + R[1] * nr, inZ = A[2] * na + R[2] * nr;
+    const k0 = Math.max(k - 1, 0), k1 = Math.min(k + 1, NU);
+    for (let j = 0; j <= NV; j++) {
+      const j0 = Math.max(j - 1, 0), j1 = Math.min(j + 1, NV), idx = k * (NV + 1) + j;
+      const ia = k1 * (NV + 1) + j, ib = k0 * (NV + 1) + j, ic = k * (NV + 1) + j1, id = k * (NV + 1) + j0;
+      const ux = PX[ia] - PX[ib], uy = PY[ia] - PY[ib], uz = PZ[ia] - PZ[ib];
+      const vx = PX[ic] - PX[id], vy = PY[ic] - PY[id], vz = PZ[ic] - PZ[id];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const l = Math.hypot(nx, ny, nz);
+      if (l < 1e-12) { nx = inX; ny = inY; nz = inZ; }
+      else {
+        if (nx * inX + ny * inY + nz * inZ < 0) { nx = -nx; ny = -ny; nz = -nz; }
+        nx /= l; ny /= l; nz /= l;
+      }
+      NX[idx] = nx; NY[idx] = ny; NZ[idx] = nz;
+    }
+  }
+  for (let k = 0; k < NU; k++) {
+    for (let j = 0; j < NV; j++) {
+      const i00 = k * (NV + 1) + j, i10 = i00 + NV + 1;
+      rasterTri(i00, i10, i10 + 1, pc);
+      rasterTri(i00, i10 + 1, i00 + 1, pc);
+    }
+  }
+}
+
+function splat(X, Y, Z, col, nx, ny, nz) {
+  const px = Math.floor(X * kx + bx), py = Math.floor(Y * ky + by);
+  if (px < 0 || py < 0 || px >= cols || py >= rows) return;
+  const i = py * cols + px;
+  if (Z <= ZB[i]) return;
+  ZB[i] = Z;
+  COL[0] = col[0]; COL[1] = col[1]; COL[2] = col[2];
+  writePixel(i, nx, ny, nz, 0.55);
+}
+
+const FILAMENT = hex('#d6ee96'), PISTIL = hex('#e8f8b4'), STIGMA = hex('#f4ffd2');
+const ANTHER = [hex('#b8461a'), hex('#d4621f'), hex('#8e3010')];
+
+function renderStamens(O, A, B, C, L, es, f) {
+  for (let k = 0; k < 7; k++) {
+    const pistil = k === 6;
+    const phi = f.rot0 + k * TAU / 6 + Math.PI / 6;
+    const R = pistil ? B : [Math.cos(phi) * B[0] + Math.sin(phi) * C[0],
+                            Math.cos(phi) * B[1] + Math.sin(phi) * C[1],
+                            Math.cos(phi) * B[2] + Math.sin(phi) * C[2]];
+    const T = cross(A, R);
+    const len = L * (pistil ? 0.78 : 0.9) * es, b0 = pistil ? 0.05 : 0.18, b1 = pistil ? 0.25 : 0.7;
+    const N = 48;
+    let r = L * 0.01, a = 0, X = 0, Y = 0, Z = 0;
+    for (let s = 0; s <= N; s++) {
+      const beta = b0 + b1 * s / N;
+      r += Math.sin(beta) * len / N; a += Math.cos(beta) * len / N;
+      X = O[0] + A[0] * a + R[0] * r; Y = O[1] + A[1] * a + R[1] * r; Z = O[2] + A[2] * a + R[2] * r;
+      splat(X, Y, Z + 0.002, pistil ? PISTIL : FILAMENT, A[0], A[1], A[2]);
+    }
+    // anther (or 3-lobed stigma) at the tip
+    const sz = L * (pistil ? 0.035 : 0.06) * es;
+    for (let m = -4; m <= 4; m++) {
+      for (let n = -1; n <= 1; n++) {
+        const q = m / 4, h = n * sz * 0.35;
+        const sx = X + T[0] * q * sz + A[0] * h, sy = Y + T[1] * q * sz + A[1] * h, sz2 = Z + T[2] * q * sz + A[2] * h;
+        splat(sx, sy, sz2 + 0.004, pistil ? STIGMA : ANTHER[(m + n + 9) % 3], A[0], A[1], A[2]);
+      }
+    }
+  }
+}
+
+function renderFlower(s, t) {
+  const f = s.f, L = f.L * s.grow;
+  if (L < 0.004) return;
+  const e = s.e, ee = smooth(e);
+  // bud points along the stem; the open flower turns to face outward
+  const tl = f.tilt + Math.sin(t * 0.9 + f.ph) * 0.05 * ee;
+  const fz = f.sq, k = Math.sqrt(1 - fz * fz);
+  const F = [Math.sin(tl) * k, -Math.cos(tl) * k, fz];
+  const A = vnorm([lerp(s.dir[0], F[0], ee), lerp(s.dir[1], F[1], ee), lerp(0, F[2], ee)]);
+  const [B, C] = basis(A);
+  const O = [s.head[0], s.head[1], f.z];
+  for (let i = 0; i < 6; i++) {
+    const pc = f.pet[i], outer = i % 2 === 0;
+    const ei = smooth((e - (outer ? 0 : 0.1)) / 0.9); // outer tepals open first
+    pc.e = ei;
+    const phi = f.rot0 + i * TAU / 6 + pc.var * 0.08;
+    const R = [Math.cos(phi) * B[0] + Math.sin(phi) * C[0],
+               Math.cos(phi) * B[1] + Math.sin(phi) * C[1],
+               Math.cos(phi) * B[2] + Math.sin(phi) * C[2]];
+    const Lp = L * (0.72 + 0.28 * ei) * (1 + pc.var * 0.06) * (outer ? 1 : 0.95);
+    const Wd = L * (outer ? 0.19 : 0.26) * (0.72 + 0.28 * ei);
+    const th0 = lerp(outer ? 0.42 : 0.36, outer ? 1.08 : 0.96, ei);
+    const curl = lerp(-1.25, 1.0 + pc.var * 0.25, ei);
+    const cup = lerp(0.5, 0.22, ei);
+    rasterPetal(O, A, R, Lp, Wd, th0, curl, cup, 0.09 * ei, L * 0.03, pc);
+  }
+  if (e > 0.35) renderStamens(O, A, B, C, L, smooth((e - 0.35) / 0.65), f);
+}
+
+// ---------- main loop ----------
+
+let t0 = performance.now();
+
+function frame(now) {
+  const t = Number.isNaN(FIXED_T) ? (now - t0) / 1000 : FIXED_T;
+
+  // 1) 2D layer: stars, stems, leaves, ribbon, message
+  lx.setTransform(1, 0, 0, 1, 0, 0);
+  lx.clearRect(0, 0, cols, rows);
+  const sa = smooth(t / 2);
+  for (const s of stars) {
+    const a = (0.12 + 0.18 * (0.5 + 0.5 * Math.sin(t * s.sp + s.ph))) * sa;
+    lx.fillStyle = `rgba(${s.c},${a})`;
+    lx.fillRect(s.x, s.y, 1, 1);
+  }
+
+  lx.setTransform(kx, 0, 0, ky, bx, by);
+  const state = FLOWERS.map(f => {
+    const sw = Math.sin(t * 0.6 + f.ph) * 0.008 * (1 - f.y);
+    const g = easeOut((t - 0.1 - f.d * 0.18) / 1.1);
+    return {
+      f, sw, g,
+      head: stemPoint(f, sw, g), dir: stemDir(f, sw, Math.max(g, 0.02)),
+      grow: easeOut((g - 0.55) / 0.45),
+      e: smooth((t - 1.5 - f.d * 0.85) / 2.8),
+    };
+  });
+  for (const s of state) if (s.g > 0) drawStem(s.f, s.sw, s.g);
+  for (const s of state) {
+    for (const lf of s.f.leaves) {
+      const k = easeOut((s.g - lf.s) / 0.25);
+      if (k <= 0) continue;
+      const p = stemPoint(s.f, s.sw, lf.s), d = stemDir(s.f, s.sw, lf.s);
+      drawLeaf(p[0], p[1], Math.atan2(d[1], d[0]) + lf.side * lf.ang, lf.len * k, lf.w * Math.min(1, k * 1.4));
+    }
+  }
+  drawRibbon(easeOut((t - 0.6) / 0.6));
+
+  if (MSG) {
+    const a = smooth((t - 6) / 1.6);
+    if (a > 0) {
+      lx.save();
+      lx.setTransform(1 / cw, 0, 0, 1 / ch, 0, 0);
+      const fs = Math.round(0.13 * S);
+      lx.font = `italic 700 ${fs}px Georgia, "Times New Roman", serif`;
+      lx.textAlign = 'center'; lx.textBaseline = 'middle';
+      lx.globalAlpha = a;
+      const tg = lx.createLinearGradient(ox - fs * 4, 0, ox + fs * 4, 0);
+      tg.addColorStop(0, '#ff9ccf'); tg.addColorStop(0.5, '#ffe7a8'); tg.addColorStop(1, '#ff9ccf');
+      lx.fillStyle = tg;
+      lx.fillText(MSG, ox, oy + 0.24 * S, cv.width * 0.9);
+      lx.restore();
+    }
+  }
+
+  // 2) 3D layer: lilies, z-buffered into the same pixels
+  const imgData = lx.getImageData(0, 0, cols, rows);
+  IMG = imgData.data;
+  ZB.fill(-1e9);
+  for (const s of state) renderFlower(s, t);
+  lx.putImageData(imgData, 0, 0);
+
+  // 3) pixels -> characters
+  const img = IMG, n = RAMP.length - 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  for (let y = 0, i = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++, i++) {
+      const p = i * 4, a = img[p + 3];
+      if (a < 14) continue;
+      const r = img[p], g = img[p + 1], b = img[p + 2];
+      const v = Math.max(r, g, b) / 255, l = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      let k = Math.pow((v * 0.55 + l * 0.45) * (a / 255), 0.65) * n + noise[i] * 3 + Math.sin(t * 1.7 + i * 0.61) * 0.7;
+      k = k < 1 ? 1 : k > n ? n : k | 0;
+      ctx.drawImage(atlas, k * cw, 0, cw, ch, x * cw, y * ch, cw, ch);
+    }
+  }
+
+  // 4) tint glyphs with the cell colors, add glow + background
+  ctx.globalCompositeOperation = 'source-in';
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(low, 0, 0, cols * cw, rows * ch);
+
+  gx.clearRect(0, 0, glow.width, glow.height);
+  gx.drawImage(low, 0, 0, glow.width, glow.height);
+  ctx.globalCompositeOperation = 'destination-over';
+  ctx.imageSmoothingEnabled = true;
+  ctx.globalAlpha = 0.28;
+  ctx.drawImage(glow, 0, 0, cols * cw, rows * ch);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+
+function replay() { t0 = performance.now(); }
+
+addEventListener('resize', resize);
+cv.addEventListener('click', replay);
+addEventListener('keydown', ev => {
+  const k = ev.key.toLowerCase();
+  if (k === 'r') replay();
+  if (k === 's') cv.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = 'ascii-bouquet.png';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+});
+setTimeout(() => document.getElementById('hint').classList.add('off'), 5000);
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
